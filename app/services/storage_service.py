@@ -1,4 +1,6 @@
+
 """Vault storage service for safely storing uploaded document versions."""
+
 import hashlib
 import os
 import re
@@ -33,7 +35,7 @@ class StorageService:
     ) -> tuple[str, str, int]:
         """Stream an upload to disk, enforcing a size limit and hashing its bytes.
 
-        Returns ``(absolute_file_path, sha256_hex_digest, file_size_bytes)``.
+        Returns (absolute_file_path, sha256_hex_digest, file_size_bytes).
         A temporary file is atomically moved into place after the complete upload
         has been read, so an interrupted upload is not exposed as a stored file.
         """
@@ -51,30 +53,48 @@ class StorageService:
                 mode="wb", dir=base_path, prefix=".upload-", delete=False
             ) as temp_file:
                 temp_path = temp_file.name
+
                 while chunk := upload_file.file.read(cls.CHUNK_SIZE):
                     file_size += len(chunk)
+
                     if file_size > cls.MAX_UPLOAD_SIZE:
                         raise HTTPException(
                             status_code=413,
-                            detail=f"File is too large. Maximum upload size is {cls.MAX_UPLOAD_SIZE // (1024 * 1024)} MB.",
+                            detail=(
+                                f"File is too large. Maximum upload size is "
+                                f"{cls.MAX_UPLOAD_SIZE // (1024 * 1024)} MB."
+                            ),
                         )
+
                     hasher.update(chunk)
                     temp_file.write(chunk)
 
             sha256_hash = hasher.hexdigest()
             destination_path = base_path / f"{sha256_hash}_{safe_filename}"
 
-            # Identical content already exists: reuse it instead of duplicating it.
+            # Reuse an existing file only if its contents are still intact.
             if destination_path.exists():
-                os.remove(temp_path)
+                existing_hasher = hashlib.sha256()
+
+                with open(destination_path, "rb") as existing_file:
+                    while chunk := existing_file.read(cls.CHUNK_SIZE):
+                        existing_hasher.update(chunk)
+
+                if existing_hasher.hexdigest() == sha256_hash:
+                    os.remove(temp_path)
+                else:
+                    os.replace(temp_path, destination_path)
             else:
                 os.replace(temp_path, destination_path)
+
             temp_path = None
 
             return str(destination_path), sha256_hash, file_size
+
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
+
             upload_file.file.seek(0)
 
     @classmethod
@@ -88,14 +108,26 @@ class StorageService:
         if len(data) > cls.MAX_UPLOAD_SIZE:
             raise HTTPException(
                 status_code=413,
-                detail=f"File is too large. Maximum upload size is {cls.MAX_UPLOAD_SIZE // (1024 * 1024)} MB.",
+                detail=(
+                    f"File is too large. Maximum upload size is "
+                    f"{cls.MAX_UPLOAD_SIZE // (1024 * 1024)} MB."
+                ),
             )
 
         base_path = settings.get_storage_path() / subfolder
         base_path.mkdir(parents=True, exist_ok=True)
+
         sha256_hash = hashlib.sha256(data).hexdigest()
         safe_filename = cls._safe_filename(original_filename)
         destination_path = base_path / f"{sha256_hash}_{safe_filename}"
+
         if not destination_path.exists():
             destination_path.write_bytes(data)
+        else:
+            # Do not silently reuse a corrupted existing file.
+            existing_hash = hashlib.sha256(destination_path.read_bytes()).hexdigest()
+
+            if existing_hash != sha256_hash:
+                destination_path.write_bytes(data)
+
         return str(destination_path), sha256_hash, len(data)
